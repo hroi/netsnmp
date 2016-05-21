@@ -218,7 +218,6 @@ impl SnmpError {
     }
 }
 
-
 pub trait ToOids {
     fn to_oids(&self) -> Result<Box<[oid]>, SnmpError>;
 }
@@ -249,7 +248,6 @@ impl<'a> ToOids for &'a str {
 
 impl<'a> Drop for Session {
     fn drop(&mut self) {
-        println!("Sesssion::drop(). self.inner: {:?}", self.inner as *mut raw::c_void);
         unsafe {
             snmp_sess_close(self.inner);
         }
@@ -527,11 +525,6 @@ impl Session {
         let max_repetitions = 10;
         let pdu_type = SNMP_MSG_GETBULK;
 
-        // let mut new_sess = unsafe {
-        //     let sess_ptr = snmp_sess_session(self.inner);
-        //     Session{inner: &mut *snmp_sess_open(sess_ptr)}
-        // };
-
         let pdu = try!(self.sync_response(&oids[..], pdu_type, non_repeaters, max_repetitions));
         let var_ptr = unsafe {(*pdu.inner).variables};
         let mut w = Walk {
@@ -562,11 +555,6 @@ impl Session {
         let non_repeaters = 0;
         let max_repetitions = 10;
         let pdu_type = SNMP_MSG_GETNEXT;
-
-        // let mut new_sess = unsafe {
-        //     let sess_ptr = snmp_sess_session(self.inner);
-        //     Session{inner: &mut *snmp_sess_open(sess_ptr)}
-        // };
 
         let pdu = try!(self.sync_response(&oids[..], pdu_type, non_repeaters, max_repetitions));
         let var_ptr = unsafe {(*pdu.inner).variables};
@@ -616,9 +604,6 @@ impl Pdu {
 impl Drop for Pdu {
     fn drop(&mut self) {
         unsafe {
-            println!("Pdu::drop(). self.inner: {:?} vars: {:?}",
-                     self.inner as *mut netsnmp_pdu,
-                     (*self.inner).variables);
             snmp_free_pdu(self.inner as *mut netsnmp_pdu);
         }
     }
@@ -662,9 +647,7 @@ impl<'a> fmt::Display for Variable<'a> {
         assert!(strlen > 0);
         assert!(strlen < buf_len);
 
-        // println!("str buf: {:?}", &buf[..strlen]);
         let buf: [u8; 255] = unsafe {mem::transmute(buf)};
-        // println!("s: {}", s);
         match str::from_utf8(&buf[..strlen]) {
             Ok(s) => f.write_str(s),
             Err(_) => Err(fmt::Error)
@@ -682,7 +665,6 @@ pub struct VariableIter<'a> {
 impl<'a> Drop for VariableIter<'a> {
     fn drop(&mut self) {
         if !self.head_ptr.is_null() {
-            println!("VariableIter::drop()");
             unsafe {
                 snmp_free_varbind(self.head_ptr);
             }
@@ -745,9 +727,9 @@ impl<'a> Iterator for Walk<'a> {
         }
 
         unsafe {
-            //let var_list = *cur_var.inner;
             let is_subtree = snmp_oidtree_compare(&self.root_buf[0], self.root_len,
-                                                  (*self.next_var_ptr).name, (*self.next_var_ptr).name_length) == STAT_SUCCESS;
+                                                  (*self.next_var_ptr).name,
+                                                  (*self.next_var_ptr).name_length) == STAT_SUCCESS;
             if is_subtree {
                 ptr::copy_nonoverlapping((*self.next_var_ptr).name,
                                          self.name_buf[..].as_mut_ptr(),
@@ -819,6 +801,7 @@ impl<'a> Value<'a> {
             }
         }
     }
+
     pub fn get_integer(&self) -> Option<i32> {
         match *self { Value::Integer(n) => Some(n), _ => None }
     }
@@ -846,10 +829,6 @@ impl<'a> Value<'a> {
     pub fn get_octetstring(&self) -> Option<&'a [u8]> {
         match *self { Value::OctetString(s) => Some(s), _ => None }
     }
-
-    // pub fn get_string(&self) -> Option<Box<[str]>> {
-    //     match *self { Value::String(n) => Some(n), _ => None }
-    // }
 }
 
 #[cfg(test)]
@@ -872,14 +851,17 @@ mod tests {
 
     #[test]
     fn session_get_single() {
-        use std::str;
 
-        let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3).expect("Session::new() failed");
+        let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3)
+            .expect("Session::new() failed");
 
         sess.get("SNMPv2-MIB::sysDescr.0").map(|resp| {
             resp.variables().next().map(|variable|{
                 variable.value().get_octetstring().map(|oct_str| {
-                    println!("{:?} = {:?}", variable.objid() , str::from_utf8(&oct_str[..]).unwrap());
+                    use std::str;
+                    println!("{:?} = {:?}",
+                             variable.objid(),
+                             str::from_utf8(&oct_str[..]).unwrap());
                 });
             });
         }).expect("get failed");
@@ -887,60 +869,35 @@ mod tests {
 
     #[test]
     fn session_get_bulk() {
-        // use netsnmp_sys::netsnmp_variable_list;
-        let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3).unwrap();
-        println!("get bulk");
-        if let Ok(response) = sess.get_bulk("IF-MIB::interfaces") {
-            println!("\tresponse received");
-            for var in response.variables() {
-                println!("{:?} -> {:?}", var.objid(), var.value());
-                // println!("\t\tvariable:");
-                // println!("\t\t\tinner: {:?}", var.inner as *const netsnmp_variable_list);
-                // println!("\t\t\tobjid: {:?}", var.objid());
-                // println!("\t\t\tvalue: {:?}", var.value());
-            }
-            println!("get bulk: variables done");
-        } else {
-            panic!();
+        let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3)
+            .expect("Session::new() failed");
+        let resp = sess.get_bulk("IF-MIB::interfaces").unwrap();
+        for var in resp.variables() {
+            println!("get_bulk: {:?} -> {:?}", var.objid(), var.value());
         }
-        println!("get bulk: response done");
-        // for var in sess.get_bulk("IF-MIB::interfaces").unwrap().variables() {
-        //     println!("get bulk: {:?} -> {:?}", var.objid(), var.value());
-        // }
     }
 
     #[test]
     fn session_walk() {
+        let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3)
+            .expect("Session::new() failed");
 
-        let i = 123;
+        let variables = sess.walk("IF-MIB::ifAlias").expect("walk failed");
 
-        let obj = "IF-MIB::ifDescr";
-
-        let j = 123;
-
-        let try_sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3);
-
-        match try_sess {
-            Ok(mut sess) => {
-                let walk = sess.walk(obj).expect("walk failed");
-
-                for variable in walk {
-                    variable.map(|variable| {
-                        println!("walk: {}", variable);
-                    }).expect("walk failed");
-                }
-            },
-            Err(_) => panic!()
+        for variable in variables {
+            variable.map(|variable| {
+                println!("walk: {}", variable);
+            }).expect("walk failed");
         }
-        println!("{}", i+j);
     }
 
     #[test]
     fn session_bulk_walk() {
 
-        let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3).unwrap();
+        let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3)
+            .expect("Session::new() failed");
 
-        for variable in sess.bulk_walk("IP-MIB::ip").expect("walk() failed") {
+        for variable in sess.bulk_walk("IF-MIB::ifAlias").expect("walk() failed") {
             variable.map(|variable| {
                 println!("bulk walk: {:?}   - {}", variable.value(), variable);
             }).expect("walk failed");
@@ -958,15 +915,6 @@ mod tests {
     //         Err(SnmpError::Timeout) => (), // expected
     //         _ => panic!()
     //     }
-    // }
-
-    // #[test]
-    // fn oidbuf_load() {
-    //     let mut req = Oidbuf::new();
-    //     req.load("IF-MIB::ifDescr").expect("loading failed");
-    //     let expected = &[1, 3, 6, 1, 2, 1, 2, 2, 1, 2];
-    //     assert_eq!(expected, &req[..]);
-    //     println!("oid: {:?} => {}", &req[..], req);
     // }
 
     #[test]
