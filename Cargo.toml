@@ -4,4 +4,5 @@ version = "0.1.0"
 authors = ["Hroi Sigurdsson <hroi@asdf.dk>"]
 
 [dependencies]
-netsnmp-sys = { path = "../netsnmp-sys" }
+# netsnmp-sys = { path = "../netsnmp-sys" }
+netsnmp-sys = "^0.1.1"

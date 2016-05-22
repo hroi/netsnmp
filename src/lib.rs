@@ -816,17 +816,18 @@ impl<'a> Iterator for Walk<'a> {
         }
 
         unsafe {
-            let is_subtree = snmp_oidtree_compare(&self.root_buf[0], self.root_len,
-                                                  (*self.next_var_ptr).name,
-                                                  (*self.next_var_ptr).name_length) == STAT_SUCCESS;
+            let next_var = *self.next_var_ptr;
+            let is_subtree = snmp_oidtree_compare(self.root_buf.as_ptr(), self.root_len,
+                                                  next_var.name, next_var.name_length)
+                == STAT_SUCCESS;
             if is_subtree {
-                ptr::copy_nonoverlapping((*self.next_var_ptr).name,
-                                         self.name_buf[..].as_mut_ptr(),
-                                         (*self.next_var_ptr).name_length);
-                self.name_len = (*self.next_var_ptr).name_length;
+                ptr::copy_nonoverlapping(next_var.name,
+                                         self.name_buf.as_mut_ptr(),
+                                         next_var.name_length);
+                self.name_len = next_var.name_length;
 
                 self.cur_var_ptr = self.next_var_ptr;
-                self.next_var_ptr = (*self.cur_var_ptr).next_variable;
+                self.next_var_ptr = next_var.next_variable;
                 if (*self.cur_var_ptr)._type == SNMP_ENDOFMIBVIEW {
                     return None;
                 }
@@ -992,7 +993,8 @@ mod tests {
             variable.map(|var| {
                 let oids = var.objid();
                 match var.value() {
-                    Value::OctetString(val) => println!("{}\t=> {}", oids.oid_name(), &String::from_utf8_lossy(val)),
+                    Value::OctetString(val) =>
+                        println!("{}\t=> {}", oids.oid_name(), &String::from_utf8_lossy(val)),
                     val => println!("{}\t=> {:?}", oids.oid_name(), val),
                 }
             }).expect("walk failed");
