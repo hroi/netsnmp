@@ -4,7 +4,8 @@ use netsnmp_sys::*;
 
 use std::fmt;
 use std::ffi;
-use std::marker::PhantomData;
+use std::net;
+use std::marker;
 use std::mem;
 use std::os::raw;
 use std::ptr;
@@ -345,7 +346,6 @@ pub struct Session {
 }
 
 impl Session {
-
     pub fn new(host: &str, opts: SessOpts) -> Result<Session, SnmpError> {
         init(b"snmp");
         unsafe {
@@ -391,10 +391,10 @@ impl Session {
                             ss.securityLevel = SNMP_SEC_LEVEL_AUTHNOPRIV;
 
                             // auth
-                            ss.securityAuthProto     = snmp_duplicate_objid(auth_prot.as_mut_ptr(),
-                                                                              auth_prot.len());
-                            ss.securityAuthProtoLen  = auth_prot.len();
-                            ss.securityAuthKeyLen    = USM_AUTH_KU_LEN;
+                            ss.securityAuthProto    = snmp_duplicate_objid(auth_prot.as_mut_ptr(),
+                                                                           auth_prot.len());
+                            ss.securityAuthProtoLen = auth_prot.len();
+                            ss.securityAuthKeyLen   = USM_AUTH_KU_LEN;
 
                             let gen_result = generate_Ku(ss.securityAuthProto,
                                                          ss.securityAuthProtoLen as raw::c_uint,
@@ -411,10 +411,10 @@ impl Session {
                             ss.securityLevel = SNMP_SEC_LEVEL_AUTHPRIV;
 
                             // auth
-                            ss.securityAuthProto     = snmp_duplicate_objid(auth_prot.as_mut_ptr(),
-                                                                              auth_prot.len());
-                            ss.securityAuthProtoLen  = auth_prot.len();
-                            ss.securityAuthKeyLen    = USM_AUTH_KU_LEN;
+                            ss.securityAuthProto    = snmp_duplicate_objid(auth_prot.as_mut_ptr(),
+                                                                           auth_prot.len());
+                            ss.securityAuthProtoLen = auth_prot.len();
+                            ss.securityAuthKeyLen   = USM_AUTH_KU_LEN;
 
                             let gen_result = generate_Ku(ss.securityAuthProto,
                                                          ss.securityAuthProtoLen as raw::c_uint,
@@ -493,7 +493,6 @@ impl Session {
                 STAT_ERROR => {
                     let (mut cliberr, mut snmperr) = (0,0);
                     snmp_sess_error(self.inner, &mut cliberr, &mut snmperr, ptr::null_mut());
-                    println!("sync_response return error: libc: {}, snmp: {}", cliberr, snmperr);
                     Err(SnmpError::from_snmperr(snmperr))
                 },
                 _ => panic!("bad return value from snmp_sess_synch_response") // TODO
@@ -531,13 +530,13 @@ impl Session {
             session: self,
             pdu: pdu,
 
-            root_buf: [0;128],
+            root_buf: [0; MAX_OID_LEN],
             root_len: oids.len(),
             pdu_type: pdu_type,
             non_repeaters: 0,
             max_repetitions: 10,
 
-            name_buf: [0; 128],
+            name_buf: [0; MAX_OID_LEN],
             name_len: oids.len(),
 
             cur_var_ptr: ptr::null(),
@@ -562,13 +561,13 @@ impl Session {
             session: self,
             pdu: pdu,
 
-            root_buf: [0;128],
+            root_buf: [0; MAX_OID_LEN],
             root_len: oids.len(),
             pdu_type: pdu_type,
             non_repeaters: 0,
             max_repetitions: 10,
 
-            name_buf: [0; 128],
+            name_buf: [0; MAX_OID_LEN],
             name_len: oids.len(),
 
             cur_var_ptr: ptr::null(),
@@ -586,18 +585,17 @@ pub struct Pdu {
 }
 
 impl Pdu {
-
     pub fn variables<'a >(&'a self) -> VariableIter<'a> {
         unsafe {
             VariableIter{head_ptr: ptr::null_mut(), cur_ptr: ptr::null(),
-                         next_ptr: (*self.inner).variables, marker: PhantomData}
+                         next_ptr: (*self.inner).variables, marker: marker::PhantomData}
         }
     }
 
     pub fn cloned_variables(&self) -> VariableIter {
         let clone_ptr = unsafe { snmp_clone_varbind((*self.inner).variables) };
         VariableIter{head_ptr: clone_ptr, cur_ptr: ptr::null(),
-                     next_ptr: clone_ptr, marker: PhantomData}
+                     next_ptr: clone_ptr, marker: marker::PhantomData}
     }
 }
 
@@ -614,17 +612,13 @@ pub struct Variable<'a> {
     inner: &'a netsnmp_variable_list,
 }
 
-use std::net::Ipv4Addr;
 
 impl<'a> Variable<'a> {
-
     pub fn objid(&'a self) -> &'a [oid] { // aka name()
-        unsafe{
-            let name_ptr    = (*self.inner).name;
-            let name_length = (*self.inner).name_length;
-            assert!(!name_ptr.is_null());
-            slice::from_raw_parts(name_ptr, name_length)
-        }
+        let name_ptr    = self.inner.name;
+        let name_length = self.inner.name_length;
+        assert!(!name_ptr.is_null());
+        unsafe{ slice::from_raw_parts(name_ptr, name_length) }
     }
 
     pub fn value(&'a self) -> Value<'a> {
@@ -637,29 +631,124 @@ impl<'a> Variable<'a> {
 
 impl<'a> fmt::Display for Variable<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        let mut buf = [0 as raw::c_char; 255];
-        let buf_len = buf.len();
+        let mut buf = [0u8; 1<<10];
+
         let strlen = unsafe {
-            snprint_variable(&mut buf[0], buf_len,
-                             (*self.inner).name, (*self.inner).name_length,
+            snprint_variable(buf.as_mut_ptr() as *mut raw::c_char,
+                             buf.len(), (*self.inner).name,
+                             (*self.inner).name_length,
                              self.inner) as usize
         };
-        assert!(strlen > 0);
-        assert!(strlen < buf_len);
 
-        let buf: [u8; 255] = unsafe {mem::transmute(buf)};
-        match str::from_utf8(&buf[..strlen]) {
-            Ok(s) => f.write_str(s),
-            Err(_) => Err(fmt::Error)
+        use std::cmp::min;
+        f.write_str(&String::from_utf8_lossy( &buf[..min(strlen, buf.len())] ))
+    }
+}
+
+#[derive(Debug)]
+pub struct Tree {
+    inner: *const Struct_tree,
+}
+
+impl Tree {
+    pub fn label(&self) -> Option<&ffi::CStr> {
+        unsafe {
+            let ptr = (*self.inner).label;
+            if ptr.is_null() { None } else { Some(ffi::CStr::from_ptr(ptr)) }
+        }
+    }
+
+    pub fn augments(&self) -> Option<&ffi::CStr> {
+        unsafe {
+            let ptr = (*self.inner).augments;
+            if ptr.is_null() { None } else { Some(ffi::CStr::from_ptr(ptr)) }
+        }
+    }
+
+    pub fn hint(&self) -> Option<&ffi::CStr> {
+        unsafe {
+            let ptr = (*self.inner).hint;
+            if ptr.is_null() { None } else { Some(ffi::CStr::from_ptr(ptr)) }
+        }
+    }
+
+    pub fn units(&self) -> Option<&ffi::CStr> {
+        unsafe {
+            let ptr = (*self.inner).units;
+            if ptr.is_null() { None } else { Some(ffi::CStr::from_ptr(ptr)) }
+        }
+    }
+
+    pub fn description(&self) -> Option<&ffi::CStr> {
+        unsafe {
+            let ptr = (*self.inner).description;
+            if ptr.is_null() { None } else { Some(ffi::CStr::from_ptr(ptr)) }
+        }
+    }
+
+    pub fn reference(&self) -> Option<&ffi::CStr> {
+        unsafe {
+            let ptr = (*self.inner).reference;
+            if ptr.is_null() { None } else { Some(ffi::CStr::from_ptr(ptr)) }
+        }
+    }
+
+    pub fn default_value(&self) -> Option<&ffi::CStr> {
+        unsafe {
+            let ptr = (*self.inner).defaultValue;
+            if ptr.is_null() { None } else { Some(ffi::CStr::from_ptr(ptr)) }
+        }
+    }
+
+}
+
+pub trait GetTree {
+    fn get_tree(&self) -> Option<Tree>;
+}
+
+impl GetTree for [oid] {
+    fn get_tree(&self) -> Option<Tree> {
+        unsafe {
+            let tree_top = get_tree_head();
+            let tree_ptr  = get_tree(self.as_ptr(), self.len(), tree_top);
+            if tree_ptr.is_null() {
+                return None
+            } else {
+                Some(Tree{ inner: tree_ptr })
+            }
         }
     }
 }
 
+pub struct OidName<'a> {
+    inner: &'a [oid]
+}
+
+impl<'a> fmt::Display for OidName<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        let mut buf = [0u8; 255];
+        let len = unsafe {
+            snprint_objid(buf.as_mut_ptr() as *mut raw::c_char, buf.len(), self.inner.as_ptr(), self.inner.len())
+        };
+        f.write_str(&String::from_utf8_lossy(&buf[..len as usize]))
+    }
+}
+
+pub trait AsOidName {
+    fn oid_name(&self) -> OidName;
+}
+
+impl AsOidName for [oid] {
+    fn oid_name(&self) -> OidName {
+        OidName { inner: self }
+    }
+}
+
 pub struct VariableIter<'a> {
-    head_ptr: *mut netsnmp_variable_list, // we own this varlist, unless this is null
+    head_ptr: *mut netsnmp_variable_list,  // we own this varlist, unless this is null
     cur_ptr: *const netsnmp_variable_list, // pointer on loan
     next_ptr: *mut netsnmp_variable_list,
-    marker: PhantomData<&'a netsnmp_variable_list>,
+    marker: marker::PhantomData<&'a netsnmp_variable_list>,
 }
 
 impl<'a> Drop for VariableIter<'a> {
@@ -699,7 +788,7 @@ pub struct Walk<'a> {
     non_repeaters: isize,
     max_repetitions: isize,
 
-    name_buf: [oid; 128],
+    name_buf: [oid; MAX_OID_LEN],
     name_len: usize,
 
     cur_var_ptr: *const netsnmp_variable_list,
@@ -738,6 +827,9 @@ impl<'a> Iterator for Walk<'a> {
 
                 self.cur_var_ptr = self.next_var_ptr;
                 self.next_var_ptr = (*self.cur_var_ptr).next_variable;
+                if (*self.cur_var_ptr)._type == SNMP_ENDOFMIBVIEW {
+                    return None;
+                }
                 let ret_ptr: *const *const netsnmp_variable_list = &self.cur_var_ptr;
                 Some(Ok(mem::transmute(ret_ptr)))
             } else {
@@ -766,10 +858,8 @@ pub enum Value<'a> {
     Gauge32(u32),
     TimeTicks(u32),
     Counter64(u64),
-    IpAddress(Ipv4Addr),
-    //OctetString(Box<[u8]>),
+    IpAddress(net::Ipv4Addr),
     OctetString(&'a [u8]),
-    // String(&'a str),
 
     NoSuchObject,
     NoSuchInstance,
@@ -783,7 +873,7 @@ impl<'a> Value<'a> {
         unsafe {
             match ty {
                 ASN_INTEGER => Value::Integer(**val.integer() as i32),
-                ASN_IPADDRESS => Value::IpAddress(Ipv4Addr::from((**val.integer() as u32).to_be())),
+                ASN_IPADDRESS => Value::IpAddress(net::Ipv4Addr::from((**val.integer() as u32).to_be())),
                 ASN_COUNTER => Value::Counter32(**val.integer() as u32),
                 ASN_COUNTER64 => {
                     let c64 = **val.counter64();
@@ -822,7 +912,7 @@ impl<'a> Value<'a> {
         match *self { Value::Counter64(n) => Some(n), _ => None }
     }
 
-    pub fn get_ipaddress(&self) -> Option<Ipv4Addr> {
+    pub fn get_ipaddress(&self) -> Option<net::Ipv4Addr> {
         match *self { Value::IpAddress(n) => Some(n), _ => None }
     }
 
@@ -883,6 +973,7 @@ mod tests {
             .expect("Session::new() failed");
 
         let variables = sess.walk("IF-MIB::ifAlias").expect("walk failed");
+        //let variables = sess.walk("iso").expect("walk failed");
 
         for variable in variables {
             variable.map(|variable| {
@@ -897,9 +988,13 @@ mod tests {
         let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3)
             .expect("Session::new() failed");
 
-        for variable in sess.bulk_walk("IF-MIB::ifAlias").expect("walk() failed") {
-            variable.map(|variable| {
-                println!("bulk walk: {:?}   - {}", variable.value(), variable);
+        for variable in sess.bulk_walk("IF-MIB::interfaces").expect("walk() failed") {
+            variable.map(|var| {
+                let oids = var.objid();
+                match var.value() {
+                    Value::OctetString(val) => println!("{}\t=> {}", oids.oid_name(), &String::from_utf8_lossy(val)),
+                    val => println!("{}\t=> {:?}", oids.oid_name(), val),
+                }
             }).expect("walk failed");
         }
     }
@@ -929,4 +1024,20 @@ mod tests {
         let expected: &[u64] = &[1, 3, 6, 1, 2, 1, 2, 2, 1, 1];
         assert_eq!(&expected.to_oids().unwrap()[..], expected);
     }
+
+    #[test]
+    fn get_tree() {
+        let oids = "IF-MIB::ifHCInOctets".to_oids().unwrap();
+        let tree = oids.get_tree().expect("get_tree failed");
+
+        println!("tree:          {:?}", tree);
+        println!("label:         {:?}", tree.label());
+        println!("augments:      {:?}", tree.augments());
+        println!("hint:          {:?}", tree.hint());
+        println!("units:         {:?}", tree.units());
+        println!("description:   {:?}", tree.description());
+        println!("reference:     {:?}", tree.reference());
+        println!("default_value: {:?}", tree.default_value());
+    }
 }
+
