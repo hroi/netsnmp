@@ -219,15 +219,18 @@ impl SnmpError {
 }
 
 pub trait ToOids {
-    fn to_oids(&self) -> Result<Box<[oid]>, SnmpError>;
+
     fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError>;
+
+    fn to_oids(&self) -> Result<Box<[oid]>, SnmpError> {
+        let buf: &mut [oid] = &mut [0; MAX_OID_LEN];
+        let len = try!(self.read_oids(&mut buf[..]));
+        Ok(buf[..len].to_vec().into_boxed_slice())
+    }
+
 }
 
 impl<'a> ToOids for [oid] {
-    fn to_oids(&self) -> Result<Box<[oid]>, SnmpError> {
-        init(b"snmp");
-        Ok(self.to_vec().into_boxed_slice())
-    }
 
     fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError> {
         init(b"snmp");
@@ -241,20 +244,6 @@ impl<'a> ToOids for [oid] {
 }
 
 impl<'a> ToOids for &'a str {
-    fn to_oids(&self) -> Result<Box<[oid]>, SnmpError> {
-        init(b"snmp");
-        let buf: &mut [oid] = &mut [0; MAX_OID_LEN];
-        let cstring = ffi::CString::new(*self).unwrap();
-
-        unsafe {
-            let mut new_len = buf.len();
-            if 1 == read_objid(cstring.as_ptr(), buf.as_mut_ptr(), &mut new_len) {
-                Ok(buf[..new_len].to_vec().into_boxed_slice())
-            } else {
-                Err(SnmpError::OidParseError)
-            }
-        }
-    }
 
     fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError> {
         init(b"snmp");
