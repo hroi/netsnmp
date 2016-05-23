@@ -220,12 +220,23 @@ impl SnmpError {
 
 pub trait ToOids {
     fn to_oids(&self) -> Result<Box<[oid]>, SnmpError>;
+    fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError>;
 }
 
 impl<'a> ToOids for &'a [oid] {
     fn to_oids(&self) -> Result<Box<[oid]>, SnmpError> {
         init(b"snmp");
         Ok(self.to_vec().into_boxed_slice())
+    }
+
+    fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError> {
+        init(b"snmp");
+        if buf.len() >= self.len() {
+            &buf[..self.len()].clone_from_slice(self);
+            Ok(self.len())
+        } else {
+            Err(SnmpError::WrongLength)
+        }
     }
 }
 
@@ -239,6 +250,20 @@ impl<'a> ToOids for &'a str {
             let mut new_len = buf.len();
             if 1 == read_objid(cstring.as_ptr(), buf.as_mut_ptr(), &mut new_len) {
                 Ok(buf[..new_len].to_vec().into_boxed_slice())
+            } else {
+                Err(SnmpError::OidParseError)
+            }
+        }
+    }
+
+    fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError> {
+        init(b"snmp");
+        let cstring = ffi::CString::new(*self).unwrap();
+
+        unsafe {
+            let mut new_len = buf.len();
+            if 1 == read_objid(cstring.as_ptr(), buf.as_mut_ptr(), &mut new_len) {
+                Ok(new_len)
             } else {
                 Err(SnmpError::OidParseError)
             }
@@ -501,18 +526,21 @@ impl Session {
     }
 
     pub fn get<T: ToOids>(&mut self, name: T) -> Result<Pdu, SnmpError> {
-        let oids = try!(name.to_oids());
-        self.sync_response(&oids[..], SNMP_MSG_GET, 0, 10)
+        let buf: &mut [oid] = &mut [0; MAX_OID_LEN];
+        let len = try!(name.read_oids(&mut buf[..]));
+        self.sync_response(&buf[..len], SNMP_MSG_GET, 0, 10)
     }
 
     pub fn get_next<T: ToOids>(&mut self, name: T) -> Result<Pdu, SnmpError> {
-        let oids = try!(name.to_oids());
-        self.sync_response(&oids[..], SNMP_MSG_GETNEXT, 0, 10)
+        let buf: &mut [oid] = &mut [0; MAX_OID_LEN];
+        let len = try!(name.read_oids(&mut buf[..]));
+        self.sync_response(&buf[..len], SNMP_MSG_GETNEXT, 0, 10)
     }
 
     pub fn get_bulk<T: ToOids>(&mut self, name: T) -> Result<Pdu, SnmpError> {
-        let oids = try!(name.to_oids());
-        self.sync_response(&oids[..], SNMP_MSG_GETBULK, 0, 10)
+        let buf: &mut [oid] = &mut [0; MAX_OID_LEN];
+        let len = try!(name.read_oids(&mut buf[..]));
+        self.sync_response(&buf[..len], SNMP_MSG_GETBULK, 0, 10)
     }
 
     pub fn bulk_walk<T: ToOids>(&mut self, name: T) -> Result<Walk, SnmpError> {
