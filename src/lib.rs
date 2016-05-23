@@ -545,7 +545,9 @@ impl Session {
 
     pub fn bulk_walk<T: ToOids>(&mut self, name: T) -> Result<Walk, SnmpError> {
 
-        let oids = try!(name.to_oids());
+        let buf: &mut [oid] = &mut [0; MAX_OID_LEN];
+        let len = try!(name.read_oids(&mut buf[..]));
+        let oids = &buf[..len];
 
         let non_repeaters = 0;
         let max_repetitions = 10;
@@ -577,7 +579,10 @@ impl Session {
 
     pub fn walk<T: ToOids>(&mut self, name: T) -> Result<Walk, SnmpError> {
 
-        let oids = try!(name.to_oids());
+        let buf: &mut [oid] = &mut [0; MAX_OID_LEN];
+        let len = try!(name.read_oids(&mut buf[..]));
+        let oids = &buf[..len];
+
         let non_repeaters = 0;
         let max_repetitions = 10;
         let pdu_type = SNMP_MSG_GETNEXT;
