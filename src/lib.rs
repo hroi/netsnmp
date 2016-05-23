@@ -223,7 +223,7 @@ pub trait ToOids {
     fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError>;
 }
 
-impl<'a> ToOids for &'a [oid] {
+impl<'a> ToOids for [oid] {
     fn to_oids(&self) -> Result<Box<[oid]>, SnmpError> {
         init(b"snmp");
         Ok(self.to_vec().into_boxed_slice())
@@ -335,14 +335,14 @@ impl PrivProtocol {
     }
 }
 
-pub type AuthPassword<'a> = &'a [u8];
-pub type PrivPassword<'a> = &'a [u8];
+pub type AuthPassword = [u8];
+pub type PrivPassword = [u8];
 
 pub enum Security<'a> {
     NoAuthNoPriv,
-    AuthNoPriv(AuthProtocol, AuthPassword<'a>),
+    AuthNoPriv(AuthProtocol, &'a AuthPassword),
     AuthPriv(AuthProtocol, PrivProtocol,
-             AuthPassword<'a>, PrivPassword<'a>),
+             &'a AuthPassword, &'a PrivPassword),
 }
 
 impl<'a> Security<'a> {
@@ -356,13 +356,13 @@ impl<'a> Security<'a> {
     }
 }
 
-pub type Community<'a>    = &'a [u8];
-pub type SecurityName<'a> = &'a [u8];
+pub type Community    = [u8];
+pub type SecurityName = [u8];
 
 pub enum SessOpts<'a> {
-    V1(Community<'a>),
-    V2c(Community<'a>),
-    V3(Security<'a>, SecurityName<'a>),
+    V1(&'a Community),
+    V2c(&'a Community),
+    V3(Security<'a>, &'a SecurityName),
 }
 
 pub struct Session {
