@@ -35,7 +35,6 @@ pub enum SnmpError {
     NotWritable,
     InconsistentName,
 
-
     // SNMPERR_*
     Success,
     //GenErr, // duplicate
@@ -585,16 +584,16 @@ pub struct Pdu {
 }
 
 impl Pdu {
-    pub fn variables<'a >(&'a self) -> VariableIter<'a> {
+    pub fn variables<'a >(&'a self) -> VariableList<'a> {
         unsafe {
-            VariableIter{head_ptr: ptr::null_mut(), cur_ptr: ptr::null(),
+            VariableList{head_ptr: ptr::null_mut(), cur_ptr: ptr::null(),
                          next_ptr: (*self.inner).variables, marker: marker::PhantomData}
         }
     }
 
-    pub fn cloned_variables(&self) -> VariableIter {
+    pub fn cloned_variables(&self) -> VariableList {
         let clone_ptr = unsafe { snmp_clone_varbind((*self.inner).variables) };
-        VariableIter{head_ptr: clone_ptr, cur_ptr: ptr::null(),
+        VariableList{head_ptr: clone_ptr, cur_ptr: ptr::null(),
                      next_ptr: clone_ptr, marker: marker::PhantomData}
     }
 }
@@ -612,9 +611,8 @@ pub struct Variable<'a> {
     inner: &'a netsnmp_variable_list,
 }
 
-
 impl<'a> Variable<'a> {
-    pub fn objid(&'a self) -> &'a [oid] { // aka name()
+    pub fn name(&'a self) -> &'a [oid] { // objid better name?
         let name_ptr    = self.inner.name;
         let name_length = self.inner.name_length;
         assert!(!name_ptr.is_null());
@@ -709,8 +707,8 @@ pub trait GetTree {
 impl GetTree for [oid] {
     fn get_tree(&self) -> Option<Tree> {
         unsafe {
-            let tree_top = get_tree_head();
-            let tree_ptr  = get_tree(self.as_ptr(), self.len(), tree_top);
+            let tree_top_ptr = get_tree_head();
+            let tree_ptr  = get_tree(self.as_ptr(), self.len(), tree_top_ptr);
             if tree_ptr.is_null() {
                 return None
             } else {
@@ -728,7 +726,8 @@ impl<'a> fmt::Display for OidName<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         let mut buf = [0u8; 255];
         let len = unsafe {
-            snprint_objid(buf.as_mut_ptr() as *mut raw::c_char, buf.len(), self.inner.as_ptr(), self.inner.len())
+            snprint_objid(buf.as_mut_ptr() as *mut raw::c_char, buf.len(),
+                          self.inner.as_ptr(), self.inner.len())
         };
         f.write_str(&String::from_utf8_lossy(&buf[..len as usize]))
     }
@@ -744,14 +743,14 @@ impl AsOidName for [oid] {
     }
 }
 
-pub struct VariableIter<'a> {
+pub struct VariableList<'a> {
     head_ptr: *mut netsnmp_variable_list,  // we own this varlist, unless this is null
     cur_ptr: *const netsnmp_variable_list, // pointer on loan
     next_ptr: *mut netsnmp_variable_list,
     marker: marker::PhantomData<&'a netsnmp_variable_list>,
 }
 
-impl<'a> Drop for VariableIter<'a> {
+impl<'a> Drop for VariableList<'a> {
     fn drop(&mut self) {
         if !self.head_ptr.is_null() {
             unsafe {
@@ -761,7 +760,7 @@ impl<'a> Drop for VariableIter<'a> {
     }
 }
 
-impl<'a> Iterator for VariableIter<'a> {
+impl<'a> Iterator for VariableList<'a> {
     type Item = &'a Variable<'a>;
     fn next(&mut self) -> Option<&'a Variable<'a>> {
         unsafe {
@@ -817,6 +816,12 @@ impl<'a> Iterator for Walk<'a> {
 
         unsafe {
             let next_var = *self.next_var_ptr;
+
+            if &self.root_buf[..self.root_len] == slice::from_raw_parts(next_var.name,
+                                                                        next_var.name_length) {
+                return Some(Err(SnmpError::OidNonIncreasing));
+            }
+
             let is_subtree = snmp_oidtree_compare(self.root_buf.as_ptr(), self.root_len,
                                                   next_var.name, next_var.name_length)
                 == STAT_SUCCESS;
@@ -871,24 +876,25 @@ pub enum Value<'a> {
 
 impl<'a> Value<'a> {
     fn from_vardata(ty: raw::c_uchar, mut val: netsnmp_vardata, val_len: usize) -> Value<'a> {
+        use Value::*;
         unsafe {
             match ty {
-                ASN_INTEGER => Value::Integer(**val.integer() as i32),
-                ASN_IPADDRESS => Value::IpAddress(net::Ipv4Addr::from((**val.integer() as u32).to_be())),
-                ASN_COUNTER => Value::Counter32(**val.integer() as u32),
-                ASN_COUNTER64 => {
+                ASN_INTEGER         => Integer(**val.integer() as i32),
+                ASN_IPADDRESS       => IpAddress(net::Ipv4Addr::from((**val.integer() as u32).to_be())),
+                ASN_COUNTER         => Counter32(**val.integer() as u32),
+                ASN_COUNTER64       => {
                     let c64 = **val.counter64();
-                    Value::Counter64(mem::transmute([c64.low as u32, c64.high as u32]))
+                    Counter64(mem::transmute([c64.low as u32, c64.high as u32]))
                 }
-                ASN_GAUGE => Value::Gauge32(**val.integer() as u32),
-                ASN_OCTET_STR => Value::OctetString(slice::from_raw_parts(*val.string(), val_len)),
-                ASN_TIMETICKS => Value::TimeTicks(**val.integer() as u32),
+                ASN_GAUGE           => Gauge32(**val.integer() as u32),
+                ASN_OCTET_STR       => OctetString(slice::from_raw_parts(*val.string(), val_len)),
+                ASN_TIMETICKS       => TimeTicks(**val.integer() as u32),
 
-                SNMP_NOSUCHOBJECT => Value::NoSuchObject,
-                SNMP_NOSUCHINSTANCE => Value::NoSuchInstance,
-                SNMP_ENDOFMIBVIEW => Value::EndOfMibView,
+                SNMP_NOSUCHOBJECT   => NoSuchObject,
+                SNMP_NOSUCHINSTANCE => NoSuchInstance,
+                SNMP_ENDOFMIBVIEW   => EndOfMibView,
 
-                n => Value::UnsupportedType(n),
+                n                   => UnsupportedType(n),
             }
         }
     }
@@ -951,7 +957,7 @@ mod tests {
                 variable.value().get_octetstring().map(|oct_str| {
                     use std::str;
                     println!("{:?} = {:?}",
-                             variable.objid(),
+                             variable.name(),
                              str::from_utf8(&oct_str[..]).unwrap());
                 });
             });
@@ -964,7 +970,7 @@ mod tests {
             .expect("Session::new() failed");
         let resp = sess.get_bulk("IF-MIB::interfaces").unwrap();
         for var in resp.variables() {
-            println!("get_bulk: {:?} -> {:?}", var.objid(), var.value());
+            println!("get_bulk: {:?} -> {:?}", var.name(), var.value());
         }
     }
 
@@ -991,7 +997,7 @@ mod tests {
 
         for variable in sess.bulk_walk("IF-MIB::interfaces").expect("walk() failed") {
             variable.map(|var| {
-                let oids = var.objid();
+                let oids = var.name();
                 match var.value() {
                     Value::OctetString(val) =>
                         println!("{}\t=> {}", oids.oid_name(), &String::from_utf8_lossy(val)),
