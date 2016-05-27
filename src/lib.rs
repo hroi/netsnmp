@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate lazy_static;
 extern crate netsnmp_sys;
 
 use netsnmp_sys::*;
@@ -11,6 +13,12 @@ use std::os::raw;
 use std::ptr;
 use std::slice;
 use std::str;
+use std::sync;
+
+lazy_static!{
+    static ref USM_LOCK: sync::Arc<sync::Mutex<()>> = sync::Arc::new(sync::Mutex::new(()));
+}
+
 
 #[derive(Debug)]
 pub enum SnmpError {
@@ -230,12 +238,25 @@ pub trait ToOids {
 
 }
 
+impl<'a> ToOids for &'a [oid] {
+
+    fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError> {
+        init(b"snmp");
+        if buf.len() >= self.len() {
+            &buf[..self.len()].copy_from_slice(self);
+            Ok(self.len())
+        } else {
+            Err(SnmpError::WrongLength)
+        }
+    }
+}
+
 impl<'a> ToOids for [oid] {
 
     fn read_oids(&self, buf: &mut[oid]) -> Result<usize, SnmpError> {
         init(b"snmp");
         if buf.len() >= self.len() {
-            &buf[..self.len()].clone_from_slice(self);
+            &buf[..self.len()].copy_from_slice(self);
             Ok(self.len())
         } else {
             Err(SnmpError::WrongLength)
@@ -260,12 +281,8 @@ impl<'a> ToOids for &'a str {
     }
 }
 
-impl<'a> Drop for Session {
-    fn drop(&mut self) {
-        unsafe {
-            snmp_sess_close(self.inner);
-        }
-    }
+pub fn netsnmp_init() {
+    init(b"snmp");
 }
 
 #[derive(Debug)]
@@ -346,7 +363,8 @@ impl<'a> Security<'a> {
 }
 
 pub type Community    = [u8];
-pub type SecurityName = [u8];
+//pub type SecurityName = [u8];
+pub type SecurityName = str;
 
 pub enum SessOpts<'a> {
     V1(&'a Community),
@@ -356,11 +374,21 @@ pub enum SessOpts<'a> {
 
 pub struct Session {
     inner: *mut raw::c_void,
+    /// Protects non-threadsafe Net-SNMP ops (USM)
+    lock: sync::Arc<sync::Mutex<()>>,
+}
+
+impl<'a> Drop for Session {
+    fn drop(&mut self) {
+        unsafe {
+            snmp_sess_close(self.inner);
+        }
+    }
 }
 
 impl Session {
     pub fn new(host: &str, opts: SessOpts) -> Result<Session, SnmpError> {
-        init(b"snmp");
+        //init(b"snmp");
         unsafe {
             let mut ss: netsnmp_session = mem::zeroed(); // session spec
             snmp_sess_init(&mut ss);
@@ -388,12 +416,12 @@ impl Session {
                 V3(security, security_name) => {
                     ss.version = SNMP_VERSION_3;
 
-                    let security_name_dup = security_name.to_vec();
+                    ss.securityModel = SNMP_SEC_MODEL_USM;
 
-                    ss.securityName = security_name_dup.as_ptr() as *mut raw::c_char;
-                    ss.securityNameLen = security_name.len();
+                    let security_name_dup = ffi::CString::new(security_name).unwrap();
 
-                    mem::forget(security_name_dup); // snmp_sess_close() handles freeing.
+                    ss.securityNameLen = security_name_dup.to_bytes().len();
+                    ss.securityName = security_name_dup.into_raw();
 
                     use Security::*;
                     match security {
@@ -442,7 +470,7 @@ impl Session {
 
                             // priv
                             ss.securityPrivProto    = snmp_duplicate_objid(priv_prot.as_mut_ptr(),
-                                                                             priv_prot.len());
+                                                                           priv_prot.len());
                             ss.securityPrivProtoLen = priv_prot.len();
                             ss.securityPrivKeyLen   = USM_PRIV_KU_LEN;
 
@@ -469,7 +497,7 @@ impl Session {
                 snmp_error(&mut ss, &mut pcliberr, &mut psnmperr, ptr::null_mut());
                 Err(SnmpError::from_snmperr(psnmperr))
             } else {
-                Ok(Session {inner: sess_ptr})
+                Ok(Session {inner: sess_ptr, lock: USM_LOCK.clone()})
             }
         }
     }
@@ -488,7 +516,20 @@ impl Session {
 
             let mut response_ptr: *mut netsnmp_pdu = ptr::null_mut();
 
-            let sync_response = snmp_sess_synch_response(self.inner, pdu, &mut response_ptr);
+            let sess_ptr = snmp_sess_session(self.inner);
+            assert!(!sess_ptr.is_null());
+            let sync_response = {
+                if (*sess_ptr).version == SNMP_VERSION_3 {
+                    // Net-Snmp USM is not thread-safe :(
+                    let _ = self.lock.lock().unwrap();
+                    let ret = snmp_sess_synch_response(self.inner, pdu, &mut response_ptr);
+                    //println!("lock");
+                    ret
+                } else {
+                    snmp_sess_synch_response(self.inner, pdu, &mut response_ptr)
+                }
+            };
+
             let ret = match sync_response {
                 STAT_SUCCESS => {
                     assert!(!response_ptr.is_null());
@@ -505,7 +546,9 @@ impl Session {
                 STAT_TIMEOUT => Err(SnmpError::Timeout),
                 STAT_ERROR => {
                     let (mut cliberr, mut snmperr) = (0,0);
-                    snmp_sess_error(self.inner, &mut cliberr, &mut snmperr, ptr::null_mut());
+                    let mut errstr: *mut raw::c_char = ptr::null_mut();
+                    snmp_sess_error(self.inner, &mut cliberr, &mut snmperr, &mut errstr as *mut *mut raw::c_char);
+                    //println!("err: {}", ffi::CStr::from_ptr(errstr).to_string_lossy());
                     Err(SnmpError::from_snmperr(snmperr))
                 },
                 _ => panic!("bad return value from snmp_sess_synch_response") // TODO
@@ -600,6 +643,8 @@ impl Session {
         Ok(w)
     }
 }
+
+unsafe impl Send for Session {}
 
 pub struct Pdu {
     inner: *mut netsnmp_pdu,
@@ -965,7 +1010,7 @@ mod tests {
     // const SNMP_SESS_OPTS_V2C: SessOpts<'static> = V2c(SNMP_COMMUNITY);
 
     const SNMP_SECURITY: Security<'static> = AuthPriv(SHA, AES, b"rustyauth", b"rustypriv");
-    const SNMP_USER: &'static [u8] = b"rustyuser";
+    const SNMP_USER: &'static str = "rustyuser";
     const SNMP_SESS_OPTS_V3: SessOpts<'static> = V3(SNMP_SECURITY, SNMP_USER);
 
     #[test]
