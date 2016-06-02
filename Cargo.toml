@@ -6,5 +6,6 @@ authors = ["Hroi Sigurdsson <hroi@asdf.dk>"]
 [dependencies]
 netsnmp-sys = { path = "../netsnmp-sys" }
 lazy_static = "0.2.1"
+libc = "^0.2.11"
 # netsnmp-sys = { git = "https://github.com/hroi/netsnmp-sys"}
 # netsnmp-sys = "^0.1.1"

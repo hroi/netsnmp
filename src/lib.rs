@@ -1,9 +1,11 @@
 #[macro_use]
 extern crate lazy_static;
 extern crate netsnmp_sys;
+extern crate libc;
 
 use netsnmp_sys::*;
 
+use std::collections::HashSet;
 use std::fmt;
 use std::ffi;
 use std::net;
@@ -369,13 +371,13 @@ pub type SecurityName = str;
 pub enum SessOpts<'a> {
     V1(&'a Community),
     V2c(&'a Community),
-    V3(Security<'a>, &'a SecurityName),
+    V3(&'a SecurityName, Security<'a>),
 }
 
 pub struct Session {
     inner: *mut raw::c_void,
-    /// Protects non-threadsafe Net-SNMP ops (USM)
-    lock: sync::Arc<sync::Mutex<()>>,
+    // Protects non-threadsafe Net-SNMP ops (USM)
+    // lock: sync::Arc<sync::Mutex<()>>,
 }
 
 impl<'a> Drop for Session {
@@ -387,8 +389,9 @@ impl<'a> Drop for Session {
 }
 
 impl Session {
-    pub fn new(host: &str, opts: SessOpts) -> Result<Session, SnmpError> {
-        //init(b"snmp");
+
+    pub fn build(host: &str, opts: SessOpts) -> Result<netsnmp_session, SnmpError> {
+        netsnmp_init();
         unsafe {
             let mut ss: netsnmp_session = mem::zeroed(); // session spec
             snmp_sess_init(&mut ss);
@@ -413,7 +416,7 @@ impl Session {
                     ss.community_len = community.len();
                     ss.community = community.as_ptr() as *mut u8;
                 },
-                V3(security, security_name) => {
+                V3(security_name, security) => {
                     ss.version = SNMP_VERSION_3;
 
                     ss.securityModel = SNMP_SEC_MODEL_USM;
@@ -489,6 +492,14 @@ impl Session {
                     }
                 }
             } // match opts {...}
+            Ok(ss)
+        }
+    }
+
+    pub fn new(host: &str, opts: SessOpts) -> Result<Session, SnmpError> {
+        //init(b"snmp");
+        let mut ss = try!(Self::build(host, opts));
+        unsafe {
 
             let sess_ptr = snmp_sess_open(&mut ss);
             if sess_ptr.is_null() {
@@ -497,10 +508,11 @@ impl Session {
                 snmp_error(&mut ss, &mut pcliberr, &mut psnmperr, ptr::null_mut());
                 Err(SnmpError::from_snmperr(psnmperr))
             } else {
-                Ok(Session {inner: sess_ptr, lock: USM_LOCK.clone()})
+                Ok(Session {inner: sess_ptr})
             }
         }
     }
+
 
     pub fn sync_response(&mut self, name: &[oid], pdu_type: i32,
                          non_repeaters: isize, max_repetitions: isize)
@@ -521,7 +533,7 @@ impl Session {
             let sync_response = {
                 if (*sess_ptr).version == SNMP_VERSION_3 {
                     // Net-Snmp USM is not thread-safe :(
-                    let _ = self.lock.lock().unwrap();
+                    let _ = USM_LOCK.lock().unwrap();
                     let ret = snmp_sess_synch_response(self.inner, pdu, &mut response_ptr);
                     //println!("lock");
                     ret
@@ -642,9 +654,190 @@ impl Session {
         w.name_buf[..oids.len()].clone_from_slice(&oids[..]);
         Ok(w)
     }
+
+}
+
+pub struct InnerSession {
+    inner: *const netsnmp_session,
+}
+
+impl InnerSession {
+    pub fn peername(&self) -> &ffi::CStr {
+        unsafe {
+            assert!(!(*self.inner).peername.is_null());
+            ffi::CStr::from_ptr((*self.inner).peername)
+        }
+    }
+
+    pub fn localname(&self) -> &ffi::CStr {
+        unsafe {
+            assert!(!(*self.inner).localname.is_null());
+            ffi::CStr::from_ptr((*self.inner).localname)
+        }
+    }
+
+    pub fn remote_port(&self) -> u16 {
+        unsafe {(*self.inner).remote_port as u16}
+    }
+
+    pub fn local_port(&self) -> u16 {
+        unsafe {(*self.inner).local_port as u16}
+    }
+
+    pub fn version(&self) -> i64 {
+        unsafe {(*self.inner).version as i64}
+    }
+
+    pub fn retries(&self) -> i32 {
+        unsafe {(*self.inner).retries as i32}
+    }
+
+    pub fn timeout(&self) -> i64 {
+        unsafe {(*self.inner).timeout as i64}
+    }
+
+    pub fn flags(&self) -> u64 {
+        unsafe {(*self.inner).flags as u64}
+    }
+
+    pub fn sessid(&self) -> i64 {
+        unsafe {(*self.inner).sessid as i64}
+    }
 }
 
 unsafe impl Send for Session {}
+
+unsafe extern fn async_response(op: raw::c_int,
+                                sess: *mut netsnmp_session,
+                                reqid: raw::c_int,
+                                pdu: *mut netsnmp_pdu,
+                                magic: *mut raw::c_void) -> raw::c_int {
+
+    let async: &Async = mem::transmute(magic);
+    let sess = InnerSession{inner: sess};
+
+    if let Some(ref callback) = async.callback {
+        match op {
+            NETSNMP_CALLBACK_OP_RECEIVED_MESSAGE => {
+                let pdu: &Pdu = mem::transmute(&pdu);
+                callback(sess, Ok(pdu));
+            },
+            NETSNMP_CALLBACK_OP_TIMED_OUT => {
+                callback(sess, Err(SnmpError::Timeout));
+            }
+            NETSNMP_CALLBACK_OP_SEND_FAILED => {},
+            NETSNMP_CALLBACK_OP_CONNECT => {},
+            NETSNMP_CALLBACK_OP_DISCONNECT => {
+                callback(sess, Err(SnmpError::Abort));
+            },
+            _ => {},
+        }
+    }
+    1
+}
+
+
+// pub type AsyncCallback = Fn(*const netsnmp_session, Result<Pdu,SnmpError>);
+
+pub struct Async<'a> {
+    numfds: raw::c_int,
+    fdset: libc::fd_set,
+    timeout: libc::timeval,
+    block: raw::c_int,
+    outstanding: usize,
+    sessions: HashSet<*mut raw::c_void>,
+    callback: Option<Box<Fn(InnerSession, Result<&'a Pdu, SnmpError>)>>,
+}
+
+impl<'a> Async<'a> {
+    pub fn new() -> Async<'a> {
+        unsafe {
+            let mut ret = Async {
+                numfds: 0,
+                fdset: mem::uninitialized(),
+                timeout: mem::zeroed(),
+                block: 1,
+                outstanding: 0,
+                sessions: HashSet::new(),
+                callback: None,
+            };
+            libc::FD_ZERO(&mut ret.fdset);
+            ret
+        }
+    }
+
+    pub fn async_response(&mut self, sess: &mut Session, name: &[oid], pdu_type: i32,
+                          non_repeaters: isize, max_repetitions: isize) {
+        unsafe {
+            //let sess_ptr = snmp_sess_session(sess.inner);
+            self.sessions.insert(sess.inner);
+
+            let pdu = snmp_pdu_create(pdu_type);
+            snmp_add_null_var(pdu, name.as_ptr(), name.len());
+
+            if pdu_type == SNMP_MSG_GETBULK {
+                (*pdu).errstat  = non_repeaters as raw::c_long;   // aka non-repeaters
+                (*pdu).errindex = max_repetitions as raw::c_long; // aka max-repetitions
+            }
+
+
+            let ret = snmp_sess_async_send(sess.inner, pdu,
+                                           Some(async_response),
+                                           mem::transmute(&*self));
+            if ret > 0 {
+                self.outstanding += 1;
+            } else {
+                snmp_perror(ffi::CString::new("snmp_send").unwrap().into_raw());
+                snmp_free_pdu(pdu);
+            }
+        }
+    }
+
+    pub fn get(&mut self, sess: &mut Session, name: &[oid]) {
+        self.async_response(sess, name, SNMP_MSG_GET, 0, 10)
+    }
+
+    pub fn get_next(&mut self, sess: &mut Session, name: &[oid]) {
+        self.async_response(sess, name, SNMP_MSG_GETNEXT, 0, 10)
+    }
+
+    pub fn get_bulk(&mut self, sess: &mut Session, name: &[oid]) {
+        self.async_response(sess, name, SNMP_MSG_GETBULK, 0, 10)
+    }
+
+    pub fn run<F>(&mut self, f: F)
+        where F: Fn(InnerSession, Result<&Pdu,SnmpError>) + 'static {
+        self.callback = Some(Box::new(f));
+        unsafe {
+            while self.outstanding > 0 {
+
+                for sess in &self.sessions {
+                    snmp_sess_select_info(*sess, &mut self.numfds,
+                                          &mut self.fdset,
+                                          &mut self.timeout, &mut self.block);
+                }
+
+                let count = libc::select(self.numfds, &mut self.fdset,
+                                         ptr::null_mut(), ptr::null_mut(),
+                                         &mut self.timeout);
+                if count < 0 {
+                    panic!("select failed");
+                }
+                if count > 0 {
+                    self.outstanding -= count as usize;
+                    for sess in &self.sessions {
+                        snmp_sess_read(*sess, &mut self.fdset);
+                    }
+                } else {
+                    self.outstanding = 0;
+                    for sess in &self.sessions {
+                        snmp_sess_timeout(*sess);
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub struct Pdu {
     inner: *mut netsnmp_pdu,
@@ -1006,12 +1199,12 @@ mod tests {
 
     const SNMP_PEERNAME: &'static str = "edgy.asdf.dk";
 
-    // const SNMP_COMMUNITY: &'static [u8] = b"st0vsuger";
-    // const SNMP_SESS_OPTS_V2C: SessOpts<'static> = V2c(SNMP_COMMUNITY);
+    #[allow(dead_code)]
+    const SNMP_SESS_OPTS_V2C: SessOpts<'static> = V2c(b"st0vsuger");
 
     const SNMP_SECURITY: Security<'static> = AuthPriv(SHA, AES, b"rustyauth", b"rustypriv");
     const SNMP_USER: &'static str = "rustyuser";
-    const SNMP_SESS_OPTS_V3: SessOpts<'static> = V3(SNMP_SECURITY, SNMP_USER);
+    const SNMP_SESS_OPTS_V3: SessOpts<'static> = V3(SNMP_USER, SNMP_SECURITY);
 
     #[test]
     fn session_get_single() {
@@ -1043,6 +1236,7 @@ mod tests {
 
     #[test]
     fn session_walk() {
+        //netsnmp_init();
         let mut sess = Session::new(SNMP_PEERNAME, SNMP_SESS_OPTS_V3)
             .expect("Session::new() failed");
 
@@ -1072,6 +1266,46 @@ mod tests {
                 }
             }).expect("walk failed");
         }
+    }
+
+    #[test]
+    pub fn async_get() {
+        let oids = vec![
+            "SNMPv2-MIB::sysName".to_oids().unwrap(),
+            "SNMPv2-MIB::sysLocation".to_oids().unwrap(),
+            "SNMPv2-MIB::sysUpTime".to_oids().unwrap(),
+            "IF-MIB::ifNumber".to_oids().unwrap(),
+            "IP-MIB::ipForwarding".to_oids().unwrap(),
+        ];
+
+        let mut sessions = vec![
+            Session::new("77.66.55.1", SessOpts::V2c(b"tyS0n43d")).unwrap(),
+            Session::new("77.66.55.2", SessOpts::V2c(b"tyS0n43d")).unwrap(),
+            Session::new("77.66.55.3", SessOpts::V2c(b"tyS0n43d")).unwrap(),
+        ];
+
+        let mut async = Async::new();
+        for sess in &mut sessions {
+            for oid in &oids {
+                async.get_next(sess, &oid[..]);
+            }
+        }
+        // async.run();
+
+        //use std::ffi;
+        async.run(|sess, resp| {
+            match resp {
+                Ok(pdu) => {
+                    for var in pdu.variables() {
+                            println!("{}: {}", sess.peername().to_string_lossy(), var);
+                    }
+                },
+                Err(SnmpError::Timeout) => println!("TIMEOUT") ,
+                Err(SnmpError::Abort) => println!("ABORT") ,
+                _ => panic!()
+            }
+        });
+
     }
 
     // #[test]
@@ -1114,5 +1348,90 @@ mod tests {
         println!("reference:     {:?}", tree.reference());
         println!("default_value: {:?}", tree.default_value());
     }
+
+    #[test]
+    pub fn pdu_build() {
+        use netsnmp_sys::*;
+        use std::mem;
+        use std::ptr;
+        // use std::ptr;
+        //let oid = "SNMPv2-MIB::sysDescr".to_oids().unwrap();
+        let oid = "IF-MIB::ifDescr".to_oids().unwrap();
+        // let mut sess = Session::build(SNMP_PEERNAME, SNMP_SESS_OPTS_V2C)
+        //     .expect("Session::build() failed");
+        let sess = Session::new("77.66.55.1", SessOpts::V2c(b"tyS0n43d"))
+            .expect("Session::build() failed");
+        let sess_ptr = unsafe { snmp_sess_session(sess.inner) };
+
+        let mut pkt = [0u8; 2048];
+        let mut pkt_ptr: *mut u8 = pkt.as_mut_ptr();
+        let mut pkt_len = pkt.len();
+        let mut offset = 0;
+
+        unsafe {
+            //let pdu = snmp_pdu_create(SNMP_MSG_GETBULK);
+            let pdu = snmp_pdu_create(SNMP_MSG_GETBULK);
+            (*pdu).version  = SNMP_VERSION_2c;
+            (*pdu).errstat  =  0;
+            (*pdu).errindex = 100;
+            snmp_add_null_var(pdu, oid.as_ptr(), oid.len());
+            let ret = snmp_build(&mut pkt_ptr, &mut pkt_len, &mut offset, sess_ptr, pdu);
+            assert!(ret == 0); // is ok
+            assert!(pkt_ptr == pkt.as_mut_ptr()); // no realloc occurred
+        }
+
+        println!("pkt_len: {}, offset: {}", pkt_len, offset);
+        let raw_pkt = &pkt[(pkt_len - offset)..];
+        // println!("pkt: {:?}", &pkt[:1(pkt_len - offset)..]);
+        print!("raw_pkt: ");
+        for b in raw_pkt {
+            print!("{:02x} ", b);
+        }
+        println!("");
+        let mut transport = unsafe {*snmp_sess_transport(sess.inner)};
+        // send the packet!
+
+        use std::net::UdpSocket;
+        use std::os::unix::io::FromRawFd;
+        //use std::mem;
+        let sock = unsafe {UdpSocket::from_raw_fd(transport.sock)};
+        // let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
+        //sock.connect("77.66.55.1:161").unwrap();
+        sock.send_to(raw_pkt, "77.66.55.1:161").unwrap();
+
+        // receive a reply!
+        let mut recv_buf = [0u8; 2048];
+        let (pkt_len2, src) = sock.recv_from(&mut recv_buf[..]).unwrap();
+        let (mut reply_pkt,_) = recv_buf.split_at_mut(pkt_len2);
+        println!("from: {:?}, recv: {:?}", src, reply_pkt);
+
+        unsafe {
+            //let raw_pdu_ptr: *mut netsnmp_pdu = Box::into_raw(Box::new(mem::zeroed()));
+            //let raw_pdu_ptr = snmp_create_sess_pdu(&mut transport, sess.inner, pkt_len2);
+            let raw_pdu_ptr = snmp_create_sess_pdu(&mut transport, ptr::null_mut(), 0);
+
+            let _version = reply_pkt[6];
+            let commstr_len = reply_pkt[8] as usize;
+            //let community = &reply_pkt[7..commstr_len+7];
+            println!("ver: {}, comm: {:?}", _version, &reply_pkt[9..commstr_len+9]);
+            let (_hdr,body)= reply_pkt.split_at_mut(9 + commstr_len);
+            let mut body_len = body.len();
+            // println!("snmp version: {}, reply community: {}",
+            //          version, String::from_utf8_lossy(community));
+            let parse_ret = snmp_pdu_parse(raw_pdu_ptr,
+                                           body.as_mut_ptr(),
+                                           &mut body_len);
+            assert!(parse_ret == 0);
+            let pdu = Pdu{inner: raw_pdu_ptr};
+            for var in pdu.variables() {
+                println!("var: {}, {:?}", var.name().oid_name(), var.value());
+            }
+            println!("done");
+            //mem::forget(sock);
+            //mem::forget(pdu);
+        }
+
+    }
+
 }
 
